@@ -1,0 +1,132 @@
+name: cloud-desktop
+
+# An ephemeral Linux desktop that lives on GitHub Actions runners.
+# Each session restores your home directory from an encrypted rclone
+# remote on boot, runs for ~5.5h, snapshots periodically, does a final
+# sync, then triggers the next session with your PAT so the chain never breaks.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:00 IST (22:30 UTC) daily safety-net. If the PAT chain ever breaks,
+    # this re-starts it. The guard step prevents overlap pile-up.
+    - cron: '30 22 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-desktop
+  # Never kill a live session because of an overlapping trigger.
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345   # comfortably under GitHub's 6h (360m) hard cap
+    env:
+      SESSION_MINUTES: '330'
+      SNAPSHOT_EVERY_MIN: '30'
+      REMOTE: 'crypt:home'        # rclone crypt remote (defined in RCLONE_CONFIG)
+      TS_HOSTNAME: 'cloudpc'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip if another session is already running
+        env:
+          GH_TOKEN: ${{ secrets.RESTART_PAT }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then echo "::warning::RESTART_PAT secret not set"; exit 0; fi
+          # gh run list includes this very run as in_progress.
+          running=$(gh run list --workflow=desktop.yml --status in-progress --json databaseId --jq 'length' || echo 0)
+          echo "In-progress runs (incl. self): $running"
+          if [ "$running" -gt 1 ]; then
+            echo "Another session is already active. Skipping to avoid duplication."
+            exit 0
+          fi
+
+      - name: Install desktop + xrdp + apps
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          # Lightweight desktop, RDP server, and the apps Gemini spec'd: office + browser.
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal xrdp dbus-x11 \
+            libreoffice libreoffice-gtk3 \
+            fonts-noto-cjk fonts-noto-color-emoji \
+            rclone \
+            policykit-1-gnome pulseaudio-utils
+          # Firefox via Mozilla's apt repo (avoid the snap stub on ubuntu-24.04).
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO- https://packages.mozilla.org/apt/repo-signing-key.gpg \
+            | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc >/dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+            | sudo tee /etc/apt/sources.list.d/mozilla.list >/dev/null
+          printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+            | sudo tee /etc/apt/preferences.d/mozilla >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y firefox
+
+      - name: Create desktop user + session
+        run: |
+          set -e
+          sudo useradd -m -s /bin/bash pc || true
+          echo "pc:${{ secrets.DESKTOP_PASSWORD }}" | sudo chpasswd
+          sudo usermod -aG ssl-cert pc       # xrdp needs ssl-cert on Debian/Ubuntu
+          sudo mkdir -p /run/xrdp
+          # Tell xrdp to launch XFCE.
+          sudo -u pc bash -c 'mkdir -p ~/.config; echo "startxfce4" > ~/.xsession; chmod +x ~/.xsession'
+
+      - name: Restore home from encrypted backup
+        run: |
+          set -e
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          echo "Restoring /home/pc from $REMOTE ..."
+          rclone copy "$REMOTE/" /home/pc \
+            --transfers 8 --checkers 8 --progress \
+            --exclude '.cache/**' \
+            --exclude 'Cache/**' \
+            --exclude '**/cache2/**' \
+            --exclude '**/startupCache/**' \
+            --exclude '**/shader-cache/**' \
+            || echo "::warning::restore failed (first boot?) continuing with empty home"
+          sudo chown -R pc:pc /home/pc
+
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Bring up Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -e
+          if [ -z "$TS_AUTHKEY" ]; then echo "::warning::TS_AUTHKEY not set, skipping tunnel"; exit 0; fi
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TS_AUTHKEY" \
+            --hostname="$TS_HOSTNAME" \
+            --accept-routes --ephemeral
+          echo "::notice::Desktop ready. Connect via RDP to $TS_HOSTNAME.<your-tailnet>.ts.net:3389 (MagicDNS) — install Tailscale on your device first."
+
+      - name: Start xrdp + run session with periodic snapshots
+        run: |
+          set -e
+          sudo systemctl enable --now xrdp 2>/dev/null || sudo service xrdp restart || true
+          echo "xrdp listening:"; (ss -ltnp 2>/dev/null || true) | grep 3389 || true
+          bash "$(pwd)/scripts/run-session.sh"
+
+      - name: Final backup
+        if: always()
+        run: bash "$(pwd)/scripts/snapshot.sh" || true
+
+      - name: Trigger next session
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.RESTART_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "No RESTART_PAT — chain will stop here."; exit 0; fi
+          gh workflow run desktop.yml --repo "$GITHUB_REPOSITORY"
+          echo "Next session queued."
