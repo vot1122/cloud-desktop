@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   schedule:
     # 04:00 IST (22:30 UTC) daily safety-net. If the PAT chain ever breaks,
-    # this re-starts it. The guard step prevents overlap pile-up.
+    # this re-starts it.
     - cron: '30 22 * * *'
 
 permissions:
@@ -27,41 +27,48 @@ jobs:
     env:
       SESSION_MINUTES: '330'
       SNAPSHOT_EVERY_MIN: '30'
-      REMOTE: 'crypt:home'        # rclone crypt remote (defined in RCLONE_CONFIG)
+      REMOTE: 'crypt:home'          # rclone crypt remote (defined in RCLONE_CONFIG)
+      TRASH_REMOTE: 'crypt:trash'   # 7-day recoverable deletions
       TS_HOSTNAME: 'cloudpc'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard — skip if another session is already running
+      - name: Guard — cancel this run if another session is already active
         env:
           GH_TOKEN: ${{ secrets.RESTART_PAT }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          set -e
-          if [ -z "$GH_TOKEN" ]; then echo "::warning::RESTART_PAT secret not set"; exit 0; fi
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::RESTART_PAT secret not set — cannot check for duplicates"
+            exit 0
+          fi
           # gh run list includes this very run as in_progress.
           running=$(gh run list --workflow=desktop.yml --status in-progress --json databaseId --jq 'length' || echo 0)
           echo "In-progress runs (incl. self): $running"
           if [ "$running" -gt 1 ]; then
-            echo "Another session is already active. Skipping to avoid duplication."
-            exit 0
+            echo "Another session is already active. Cancelling this duplicate."
+            gh run cancel "$GITHUB_RUN_ID" --repo "$GH_REPO" || true
+            sleep 15   # give GitHub time to process the cancellation
           fi
 
       - name: Install desktop + xrdp + apps
         run: |
-          set -e
+          set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -qq
-          # Lightweight desktop, RDP server, and the apps Gemini spec'd: office + browser.
           sudo apt-get install -y --no-install-recommends \
-            xfce4 xfce4-terminal xrdp dbus-x11 \
+            xfce4 xfce4-terminal thunar xclip xdg-utils \
+            xrdp dbus-x11 \
             libreoffice libreoffice-gtk3 \
             fonts-noto-cjk fonts-noto-color-emoji \
             rclone \
-            policykit-1-gnome pulseaudio-utils
+            policykit-1-gnome
           # Firefox via Mozilla's apt repo (avoid the snap stub on ubuntu-24.04).
+          # (wget to a file first — piping to tee would mask a failed download.)
           sudo install -d -m 0755 /etc/apt/keyrings
-          wget -qO- https://packages.mozilla.org/apt/repo-signing-key.gpg \
-            | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc >/dev/null
+          wget -qO /tmp/mozilla-key.gpg https://packages.mozilla.org/apt/repo-signing-key.gpg
+          sudo cp /tmp/mozilla-key.gpg /etc/apt/keyrings/packages.mozilla.org.asc
           echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
             | sudo tee /etc/apt/sources.list.d/mozilla.list >/dev/null
           printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
@@ -70,63 +77,99 @@ jobs:
           sudo apt-get install -y firefox
 
       - name: Create desktop user + session
+        env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+          if [ -z "$DESKTOP_PASSWORD" ]; then
+            echo "::error::DESKTOP_PASSWORD secret not set"
+            exit 1
+          fi
           sudo useradd -m -s /bin/bash pc || true
-          echo "pc:${{ secrets.DESKTOP_PASSWORD }}" | sudo chpasswd
+          echo "pc:${DESKTOP_PASSWORD}" | sudo chpasswd
           sudo usermod -aG ssl-cert pc       # xrdp needs ssl-cert on Debian/Ubuntu
-          sudo mkdir -p /run/xrdp
-          # Tell xrdp to launch XFCE.
+          sudo mkdir -p /run/xrdp /var/run/xrdp
+          # Tell xrdp to launch XFCE on login.
           sudo -u pc bash -c 'mkdir -p ~/.config; echo "startxfce4" > ~/.xsession; chmod +x ~/.xsession'
 
       - name: Restore home from encrypted backup
-        run: |
-          set -e
-          mkdir -p ~/.config/rclone
-          printf '%s' "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
-          echo "Restoring /home/pc from $REMOTE ..."
-          rclone copy "$REMOTE/" /home/pc \
-            --transfers 8 --checkers 8 --progress \
-            --exclude '.cache/**' \
-            --exclude 'Cache/**' \
-            --exclude '**/cache2/**' \
-            --exclude '**/startupCache/**' \
-            --exclude '**/shader-cache/**' \
-            || echo "::warning::restore failed (first boot?) continuing with empty home"
-          sudo chown -R pc:pc /home/pc
-
         env:
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          # Fail gracefully if the secret is missing or malformed.
+          if ! rclone listremotes 2>/dev/null | grep -q '^crypt:$'; then
+            echo "::warning::RCLONE_CONFIG missing or has no 'crypt' remote — starting with empty home"
+            exit 0
+          fi
+          echo "Restoring /home/pc from $REMOTE ..."
+          if ! rclone copy "$REMOTE/" /home/pc \
+              --transfers 8 --checkers 8 --fast-list \
+              --stats 30s --stats-one-line \
+              --exclude '.cache/**' \
+              --exclude 'Cache/**' \
+              --exclude '**/cache2/**' \
+              --exclude '**/startupCache/**' \
+              --exclude '**/shader-cache/**'; then
+            echo "::warning::restore failed — continuing with empty home"
+          fi
+          sudo chown -R pc:pc /home/pc
 
       - name: Bring up Tailscale
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
-          set -e
-          if [ -z "$TS_AUTHKEY" ]; then echo "::warning::TS_AUTHKEY not set, skipping tunnel"; exit 0; fi
+          set -euo pipefail
+          if [ -z "$TS_AUTHKEY" ]; then
+            echo "::warning::TS_AUTHKEY not set — desktop unreachable via tailnet"
+            exit 0
+          fi
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey="$TS_AUTHKEY" \
             --hostname="$TS_HOSTNAME" \
             --accept-routes --ephemeral
-          echo "::notice::Desktop ready. Connect via RDP to $TS_HOSTNAME.<your-tailnet>.ts.net:3389 (MagicDNS) — install Tailscale on your device first."
+          TS_IP=$(tailscale ip -4 | head -1 || echo 'unknown')
+          echo "::notice::Desktop ready at ${TS_IP} — RDP to ${TS_HOSTNAME}.<your-tailnet>.ts.net:3389 (MagicDNS)"
 
-      - name: Start xrdp + run session with periodic snapshots
+      - name: Start xrdp + run session
         run: |
-          set -e
-          sudo systemctl enable --now xrdp 2>/dev/null || sudo service xrdp restart || true
-          echo "xrdp listening:"; (ss -ltnp 2>/dev/null || true) | grep 3389 || true
-          bash "$(pwd)/scripts/run-session.sh"
+          set -euo pipefail
+          sudo systemctl enable --now xrdp 2>/dev/null || sudo service xrdp restart
+          # Readiness check: verify xrdp is actually listening before proceeding.
+          for i in $(seq 1 15); do
+            if (ss -ltn 2>/dev/null | grep -q ':3389 '); then
+              echo "xrdp is listening on :3389 (after ${i}s)"
+              break
+            fi
+            sleep 1
+          done
+          if ! (ss -ltn 2>/dev/null | grep -q ':3389 '); then
+            echo "::error::xrdp failed to start listening on :3389"
+            sudo service xrdp status || true
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/run-session.sh"
 
       - name: Final backup
-        if: always()
-        run: bash "$(pwd)/scripts/snapshot.sh" || true
+        if: always()   # even on failure or cancellation — save what we can
+        run: bash "$GITHUB_WORKSPACE/scripts/snapshot.sh" || true
 
-      - name: Trigger next session
-        if: success()
+      - name: Trigger next session (chain survives crashes, just not cancellation)
+        if: '!cancelled()'
         env:
           GH_TOKEN: ${{ secrets.RESTART_PAT }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then echo "No RESTART_PAT — chain will stop here."; exit 0; fi
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then echo "No RESTART_PAT — chain stops here."; exit 0; fi
+          # Don't add another run if one is already queued (e.g. the daily
+          # safety-net fired while this session was live) — prevents pile-up.
+          queued=$(gh run list --workflow=desktop.yml --status queued --json databaseId --jq 'length' || echo 0)
+          if [ "$queued" -gt 0 ]; then
+            echo "A run is already queued (safety net) — not adding another."
+            exit 0
+          fi
           gh workflow run desktop.yml --repo "$GITHUB_REPOSITORY"
           echo "Next session queued."
