@@ -44,7 +44,7 @@ jobs:
             exit 0
           fi
           # gh run list includes this very run as in_progress.
-          running=$(gh run list --workflow=desktop.yml --status in-progress --json databaseId --jq 'length' || echo 0)
+          running=$(gh run list --workflow=desktop.yml --status in_progress --json databaseId --jq 'length' || echo 0)
           echo "In-progress runs (incl. self): $running"
           if [ "$running" -gt 1 ]; then
             echo "Another session is already active. Cancelling this duplicate."
@@ -128,9 +128,11 @@ jobs:
             exit 0
           fi
           curl -fsSL https://tailscale.com/install.sh | sh
+          # NOTE: 'ephemeral' is a property of the AUTH KEY (set when generating
+          # it in the Tailscale admin console), NOT a CLI flag on `tailscale up`.
           sudo tailscale up --authkey="$TS_AUTHKEY" \
             --hostname="$TS_HOSTNAME" \
-            --accept-routes --ephemeral
+            --accept-routes
           TS_IP=$(tailscale ip -4 | head -1 || echo 'unknown')
           echo "::notice::Desktop ready at ${TS_IP} — RDP to ${TS_HOSTNAME}.<your-tailnet>.ts.net:3389 (MagicDNS)"
 
