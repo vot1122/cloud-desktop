@@ -1,4 +1,4 @@
-name: cloud-desktop
+Name: cloud-desktop
 
 # An ephemeral Linux desktop that lives on GitHub Actions runners.
 # Each session restores your home directory from an encrypted rclone
